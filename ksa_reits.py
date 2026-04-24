@@ -1,30 +1,40 @@
 #!/usr/bin/env python3
 """
-KSA REIT Comprehensive Analyser
-Metrics: price, performance, dividend yield, market cap,
-         drawdown (dip ratio), and Price-to-NAV (undervalue signal).
+KSA REIT table builder
+======================
+Columns are defined in a YAML file. Each column is either:
+  field : a direct key from the data bag (no calculation)
+  expr  : a Python expression evaluated against the data bag
+
+Run:
+  python ksa_reits.py                        # default columns
+  python ksa_reits.py --columns my.yaml      # custom columns
+  python ksa_reits.py --list-fields          # show all available fields
+  python ksa_reits.py --undervalued          # P/NAV < 1 only
+  python ksa_reits.py --sort yield           # sort by named column alias
 """
 
-import sys
-import warnings
-import argparse
-from datetime import datetime, timedelta
+import sys, argparse, warnings
+from pathlib import Path
+from datetime import datetime
 
 warnings.filterwarnings("ignore")
 
+# ── third-party ──────────────────────────────────────────────────────────────
 try:
     import yfinance as yf
     import pandas as pd
+    import yaml
     from tabulate import tabulate
-except ImportError:
-    sys.exit("Run: pip install yfinance pandas tabulate")
+except ImportError as e:
+    sys.exit(f"Missing dependency — run: pip install yfinance pandas tabulate pyyaml\n{e}")
 
 
-# ---------------------------------------------------------------------------
-# Universe
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1.  UNIVERSE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-REITS = {
+REITS: dict[str, str] = {
     "4330.SR": "Riyad REIT",
     "4331.SR": "AlJazira REIT",
     "4332.SR": "Jadwa REIT AlHaramain",
@@ -48,302 +58,566 @@ REITS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2.  DATA BAG — one flat dict per ticker
+#     ∙ All keys here are usable as `field` in YAML columns
+#     ∙ All keys are also available as variables inside `expr` expressions
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _pct(val) -> str:
-    if val is None or (isinstance(val, float) and (val != val)):
-        return "N/A"
-    return f"{val:+.2f}%"
-
-
-def _sar(val, decimals=2) -> str:
-    if val is None or (isinstance(val, float) and (val != val)):
-        return "N/A"
-    return f"{val:,.{decimals}f}"
-
-
-def _mcap(val) -> str:
-    """Format market cap in millions SAR."""
-    if val is None or (isinstance(val, float) and (val != val)):
-        return "N/A"
-    return f"{val / 1_000_000:,.1f}M"
-
-
-def _nav_signal(pb) -> str:
-    """Convert P/B to a human-readable NAV signal."""
-    if pb is None:
-        return "N/A"
-    if pb < 0.70:
-        return f"Deep discount ({pb:.2f}x)"
-    if pb < 0.90:
-        return f"Discount      ({pb:.2f}x)"
-    if pb <= 1.10:
-        return f"Fair value    ({pb:.2f}x)"
-    return f"Premium       ({pb:.2f}x)"
-
-
-def _return_pct(hist: pd.DataFrame, days: int) -> float | None:
-    """Compute price return over the last `days` calendar days."""
+def _pct_change(hist: pd.DataFrame, days: int) -> float | None:
     if hist.empty:
         return None
-    # Use iloc-based slicing to avoid any tz comparison issues
     cutoff = hist.index[-1] - pd.Timedelta(days=days)
     past = hist[hist.index <= cutoff]
     if past.empty:
         return None
-    start_price = float(past["Close"].iloc[-1])
-    end_price = float(hist["Close"].iloc[-1])
-    if start_price == 0:
+    s = float(past["Close"].iloc[-1])
+    e = float(hist["Close"].iloc[-1])
+    return (e - s) / s * 100 if s else None
+
+
+def _ytd(hist: pd.DataFrame) -> float | None:
+    if hist.empty:
         return None
-    return (end_price - start_price) / start_price * 100
-
-
-def _ytd_return(hist: pd.DataFrame) -> float | None:
     last = hist.index[-1]
-    # Build a tz-aware Timestamp matching the index timezone
     year_start = pd.Timestamp(last.year, 1, 1, tz=last.tzinfo)
     past = hist[hist.index < year_start]
-    if past.empty:
-        past_price = float(hist["Close"].iloc[0])
-    else:
-        past_price = float(past["Close"].iloc[-1])
-    end_price = float(hist["Close"].iloc[-1])
-    if past_price == 0:
-        return None
-    return (end_price - past_price) / past_price * 100
+    s = float(past["Close"].iloc[-1]) if not past.empty else float(hist["Close"].iloc[0])
+    e = float(hist["Close"].iloc[-1])
+    return (e - s) / s * 100 if s else None
 
 
-def _annual_dividend(ticker_obj: yf.Ticker) -> float | None:
-    """Sum dividends paid in the last 12 months."""
+def _annual_div(t: yf.Ticker) -> float | None:
     try:
-        divs = ticker_obj.dividends
-        if divs.empty:
+        d = t.dividends
+        if d.empty:
             return None
-        cutoff = divs.index[-1] - timedelta(days=365)
-        recent = divs[divs.index > cutoff]
+        cutoff = d.index[-1] - pd.Timedelta(days=365)
+        recent = d[d.index > cutoff]
         return float(recent.sum()) if not recent.empty else None
     except Exception:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Data fetcher
-# ---------------------------------------------------------------------------
+def build_data_bag(symbol: str, name: str) -> dict:
+    """
+    Returns a flat dict with every data point available for expression use.
+    Keys are grouped into:
+      identity  : ticker, symbol, name
+      price     : price, prev_close, open, day_high, day_low, high_52w, low_52w
+      market    : market_cap, shares
+      perf      : ret_1m, ret_3m, ret_6m, ret_1y, ret_ytd
+      dividend  : annual_div
+      valuation : price_book, book_value, nav_discount
+      raw_info  : every key from yf.Ticker.info (prefixed as-is)
+    """
+    bag: dict = {
+        "ticker": symbol.replace(".SR", ""),
+        "symbol": symbol,
+        "name":   name,
+        "_ok":    False,
+        "_error": None,
+    }
 
-def fetch_reit(symbol: str, name: str) -> dict:
-    row = {"Ticker": symbol.replace(".SR", ""), "Name": name}
     try:
         t = yf.Ticker(symbol)
-
-        # --- price history (1 year + a bit) ---
         hist = t.history(period="13mo", auto_adjust=True)
 
         if hist.empty:
-            row["Status"] = "No data"
-            return row
+            bag["_error"] = "no data"
+            return bag
 
-        price = float(hist["Close"].iloc[-1])
-        high52 = float(hist["High"].max())
-        low52  = float(hist["Low"].min())
+        price   = float(hist["Close"].iloc[-1])
+        high_52 = float(hist["High"].max())
+        low_52  = float(hist["Low"].min())
+        ann_div = _annual_div(t)
 
-        # Dip ratio: how far below the 52-week high (negative = dipped)
-        dip_ratio = (price - high52) / high52 * 100
+        # ── price ───────────────────────────────────────────────────────────
+        bag["price"]      = price
+        bag["high_52w"]   = high_52
+        bag["low_52w"]    = low_52
+        bag["prev_close"] = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
+        bag["open"]       = float(hist["Open"].iloc[-1])
+        bag["day_high"]   = float(hist["High"].iloc[-1])
+        bag["day_low"]    = float(hist["Low"].iloc[-1])
+        bag["volume"]     = float(hist["Volume"].iloc[-1])
 
-        # Performance
-        ret_1m  = _return_pct(hist, 30)
-        ret_3m  = _return_pct(hist, 91)
-        ret_6m  = _return_pct(hist, 182)
-        ret_1y  = _return_pct(hist, 365)
-        ret_ytd = _ytd_return(hist)
+        # ── performance ─────────────────────────────────────────────────────
+        bag["ret_1m"]  = _pct_change(hist, 30)
+        bag["ret_3m"]  = _pct_change(hist, 91)
+        bag["ret_6m"]  = _pct_change(hist, 182)
+        bag["ret_1y"]  = _pct_change(hist, 365)
+        bag["ret_ytd"] = _ytd(hist)
 
-        # Dividends
-        annual_div = _annual_dividend(t)
-        div_yield  = (annual_div / price * 100) if annual_div and price else None
+        # ── dividend ────────────────────────────────────────────────────────
+        bag["annual_div"] = ann_div
+        bag["div_yield"]  = (ann_div / price * 100) if ann_div and price else None
 
-        # Fundamentals from info
-        info = {}
+        # ── raw yfinance info (all fields) ──────────────────────────────────
+        info: dict = {}
         try:
-            info = t.info
+            info = t.info or {}
         except Exception:
             pass
 
-        market_cap  = info.get("marketCap")
-        price_book  = info.get("priceToBook")     # P/B ≈ P/NAV for REITs
-        book_value  = info.get("bookValue")        # NAV per unit
+        # flatten info into bag (so exprs can use e.g. `marketCap` directly)
+        for k, v in info.items():
+            if k not in bag:          # don't overwrite computed keys
+                bag[k] = v
 
-        # Discount to NAV
-        nav_discount = None
-        if price_book and price_book > 0:
-            nav_discount = (1 - price_book) * 100  # positive = trading below NAV
+        # ── convenience aliases for common info fields ───────────────────────
+        bag["market_cap"]  = info.get("marketCap")
+        bag["shares"]      = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
+        bag["price_book"]  = info.get("priceToBook")
+        bag["book_value"]  = info.get("bookValue")
+        bag["nav_discount"] = ((1 - bag["price_book"]) * 100) if bag["price_book"] else None
+        bag["dip_from_high"] = ((price - high_52) / high_52 * 100) if high_52 else None
+        bag["range_position"] = (
+            (price - low_52) / (high_52 - low_52) * 100
+            if (high_52 and low_52 and high_52 != low_52) else None
+        )
+        bag["trailing_pe"] = info.get("trailingPE")
+        bag["forward_pe"]  = info.get("forwardPE")
+        bag["beta"]        = info.get("beta")
+        bag["currency"]    = info.get("currency", "SAR")
 
-        row.update({
-            "Price (SAR)":      price,
-            "Mkt Cap":          market_cap,
-            "1M %":             ret_1m,
-            "3M %":             ret_3m,
-            "6M %":             ret_6m,
-            "1Y %":             ret_1y,
-            "YTD %":            ret_ytd,
-            "52W High":         high52,
-            "52W Low":          low52,
-            "Dip from High %":  dip_ratio,
-            "Div/Unit (SAR)":   annual_div,
-            "Div Yield %":      div_yield,
-            "Book/NAV (SAR)":   book_value,
-            "P/NAV (x)":        price_book,
-            "Disc/Prem %":      nav_discount,
-        })
+        bag["_ok"] = True
 
     except Exception as e:
-        row["Status"] = str(e)
+        bag["_error"] = str(e)
 
-    return row
+    return bag
 
 
-# ---------------------------------------------------------------------------
-# Display
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3.  FORMATTERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def print_table(rows: list[dict], fmt: str) -> None:
+_NA = "N/A"
+
+def _fmt(value, spec: str | None) -> str:
+    """Apply a format spec to a value. spec can be a Python format string or a
+    named formatter: pct | pct_plain | sar | mcap | x | int | raw"""
+    if value is None or (isinstance(value, float) and value != value):
+        return _NA
+
+    if spec is None:
+        return str(value) if not isinstance(value, float) else f"{value:.4g}"
+
+    named = {
+        "pct":       lambda v: f"{v:+.2f}%",
+        "pct_plain": lambda v: f"{v:.2f}%",
+        "sar":       lambda v: f"{v:,.2f}",
+        "mcap":      lambda v: (
+            f"{v/1e9:,.2f}B" if abs(v) >= 1e9 else f"{v/1e6:,.1f}M"
+        ),
+        "x":         lambda v: f"{v:.3f}x",
+        "int":       lambda v: f"{v:,.0f}",
+        "raw":       lambda v: str(v),
+    }
+    if spec in named:
+        try:
+            return named[spec](value)
+        except Exception:
+            return _NA
+
+    # treat as Python format string e.g. "{:.2f}%" or "%.2f"
+    try:
+        if "{" in spec:
+            return spec.format(value)
+        return spec % value
+    except Exception:
+        return _NA
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4.  COLUMN ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _SafeNamespace(dict):
+    """Dict that returns None for missing keys so exprs never raise NameError."""
+    def __missing__(self, key):
+        return None
+
+
+def resolve_column(col_def: dict, bag: dict) -> str:
+    """
+    col_def keys:
+      header : str            column header (supports \n for line breaks)
+      field  : str            direct key lookup in bag
+      expr   : str            Python expression; bag variables are in scope
+      fmt    : str | None     formatter (see _fmt)
+      width  : int | None     truncate string to this width
+    """
+    fmt   = col_def.get("fmt")
+    width = col_def.get("width")
+
+    raw = None
+    try:
+        if "field" in col_def:
+            raw = bag.get(col_def["field"])
+        elif "expr" in col_def:
+            ns = _SafeNamespace(bag)
+            raw = eval(col_def["expr"], {"__builtins__": {}}, ns)   # noqa: S307
+        # coerce non-numeric strings from yfinance info fields to None
+        if isinstance(raw, str) and fmt not in (None, "raw"):
+            raw = None
+    except Exception:
+        return _NA
+
+    cell = _fmt(raw, fmt)
+
+    if width and isinstance(cell, str) and len(cell) > width:
+        cell = cell[: width - 1] + "…"
+
+    return cell
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5.  DEFAULT COLUMN SPEC (used when no --columns file is given)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_COLUMNS: list[dict] = [
+    {"header": "Ticker",         "field": "ticker",        "align": "left"},
+    {"header": "Name",           "field": "name",          "align": "left", "width": 22},
+    {"header": "Price\n(SAR)",   "field": "price",         "fmt": "{:.2f}"},
+    {"header": "Mkt Cap",        "field": "market_cap",    "fmt": "mcap"},
+    {"header": "1M",             "field": "ret_1m",        "fmt": "pct"},
+    {"header": "3M",             "field": "ret_3m",        "fmt": "pct"},
+    {"header": "6M",             "field": "ret_6m",        "fmt": "pct"},
+    {"header": "1Y",             "field": "ret_1y",        "fmt": "pct"},
+    {"header": "YTD",            "field": "ret_ytd",       "fmt": "pct"},
+    {"header": "Dip from\n52W High",
+                                 "field": "dip_from_high", "fmt": "pct"},
+    {"header": "52W\nPosition",
+     "expr": "range_position",   "fmt": "{:.0f}%",
+     "header": "52W Pos\n(lo→hi)"},
+    {"header": "Div/Unit\n(SAR)","field": "annual_div",    "fmt": "{:.3f}"},
+    {"header": "Div\nYield",     "field": "div_yield",     "fmt": "pct_plain"},
+    {"header": "Book/NAV\n(SAR)","field": "book_value",    "fmt": "{:.2f}"},
+    {"header": "P/NAV",          "field": "price_book",    "fmt": "x"},
+    {"header": "Disc(+)\nPrem(-)",
+                                 "field": "nav_discount",  "fmt": "{:+.1f}%"},
+]
+
+# ─── Example custom column files (written to disk for reference) ──────────────
+EXAMPLE_DIVIDEND_YAML = """\
+# dividend_table.yaml — yield-focused columns
+# Run: python ksa_reits.py --columns dividend_table.yaml --sort yield
+columns:
+  - header: "Ticker"
+    field: ticker
+    align: left
+
+  - header: "Name"
+    field: name
+    align: left
+    width: 22
+
+  - header: "Price"
+    field: price
+    fmt: "{:.2f}"
+
+  - header: "Div/Unit"
+    field: annual_div
+    fmt: "{:.3f}"
+
+  - header: "Yield %"
+    field: div_yield
+    fmt: pct_plain
+
+  - header: "Yield on\n52W Low"
+    expr: "annual_div / low_52w * 100 if (annual_div and low_52w) else None"
+    fmt: pct_plain
+
+  - header: "Payout\nCover (x)"
+    expr: "trailingPE / (price / annual_div) if (trailingPE and annual_div and price) else None"
+    fmt: "{:.2f}x"
+
+  - header: "Mkt Cap"
+    field: market_cap
+    fmt: mcap
+"""
+
+EXAMPLE_VALUATION_YAML = """\
+# valuation_table.yaml — NAV / undervalue focus
+# Run: python ksa_reits.py --columns valuation_table.yaml --sort pnav
+columns:
+  - header: "Ticker"
+    field: ticker
+    align: left
+
+  - header: "Name"
+    field: name
+    align: left
+    width: 22
+
+  - header: "Price\n(SAR)"
+    field: price
+    fmt: "{:.2f}"
+
+  - header: "Book/NAV\n(SAR)"
+    field: book_value
+    fmt: "{:.2f}"
+
+  - header: "P/NAV"
+    field: price_book
+    fmt: x
+
+  - header: "Discount\nto NAV %"
+    field: nav_discount
+    fmt: "{:+.1f}%"
+
+  - header: "Upside to\nNAV (SAR)"
+    expr: "book_value - price if (book_value and price) else None"
+    fmt: "{:+.2f}"
+
+  - header: "52W High"
+    field: high_52w
+    fmt: "{:.2f}"
+
+  - header: "Dip %"
+    field: dip_from_high
+    fmt: pct
+
+  - header: "1Y Perf"
+    field: ret_1y
+    fmt: pct
+"""
+
+EXAMPLE_PERFORMANCE_YAML = """\
+# performance_table.yaml — returns across timeframes
+# Run: python ksa_reits.py --columns performance_table.yaml --sort 1y
+columns:
+  - header: "Ticker"
+    field: ticker
+    align: left
+
+  - header: "Name"
+    field: name
+    align: left
+    width: 22
+
+  - header: "Price"
+    field: price
+    fmt: "{:.2f}"
+
+  - header: "YTD"
+    field: ret_ytd
+    fmt: pct
+
+  - header: "1M"
+    field: ret_1m
+    fmt: pct
+
+  - header: "3M"
+    field: ret_3m
+    fmt: pct
+
+  - header: "6M"
+    field: ret_6m
+    fmt: pct
+
+  - header: "1Y"
+    field: ret_1y
+    fmt: pct
+
+  - header: "Momentum\n(1M-3M avg)"
+    expr: "(ret_1m + ret_3m) / 2 if (ret_1m is not None and ret_3m is not None) else None"
+    fmt: pct
+
+  - header: "Volatility\nProxy"
+    expr: "abs(day_high - day_low) / price * 100 if price else None"
+    fmt: "{:.2f}%"
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6.  RENDER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render_table(bags: list[dict], col_defs: list[dict], fmt: str) -> None:
+    headers = [c["header"] for c in col_defs]
+
+    rows = []
+    for bag in bags:
+        if not bag["_ok"]:
+            err = bag.get("_error", "unknown error")
+            row = [bag["ticker"], bag["name"], f"[{err}]"] + ["—"] * max(0, len(col_defs) - 3)
+            rows.append(row)
+            continue
+        rows.append([resolve_column(c, bag) for c in col_defs])
+
     if fmt == "json":
         import json
-        print(json.dumps(rows, indent=2, default=str))
+        result = []
+        for bag in bags:
+            result.append({c["header"].replace("\n", " "): resolve_column(c, bag)
+                           for c in col_defs})
+        print(json.dumps(result, indent=2))
         return
 
     if fmt == "csv":
-        df = pd.DataFrame(rows)
-        print(df.to_csv(index=False))
+        flat_headers = [h.replace("\n", " ") for h in headers]
+        print(",".join(flat_headers))
+        for row in rows:
+            print(",".join(row))
         return
 
-    # Pretty table
-    display_rows = []
-    for r in rows:
-        if "Status" in r:
-            display_rows.append([
-                r["Ticker"], r["Name"], r.get("Status", "Error"),
-                *["—"] * 14
-            ])
-            continue
+    # detect per-column alignment
+    col_align = []
+    for c in col_defs:
+        col_align.append(c.get("align", "right"))
 
-        disc = r.get("Disc/Prem %")
-        disc_str = "N/A"
-        if disc is not None:
-            disc_str = f"{disc:+.1f}%"
-
-        pnav = r.get("P/NAV (x)")
-        pnav_str = f"{pnav:.3f}x" if pnav else "N/A"
-
-        display_rows.append([
-            r["Ticker"],
-            r["Name"][:22],
-            _sar(r.get("Price (SAR)")),
-            _mcap(r.get("Mkt Cap")),
-            _pct(r.get("1M %")),
-            _pct(r.get("3M %")),
-            _pct(r.get("6M %")),
-            _pct(r.get("1Y %")),
-            _pct(r.get("YTD %")),
-            _pct(r.get("Dip from High %")),
-            _sar(r.get("Div/Unit (SAR)"), 3),
-            f"{r['Div Yield %']:.2f}%" if r.get("Div Yield %") else "N/A",
-            _sar(r.get("Book/NAV (SAR)")),
-            pnav_str,
-            disc_str,
-        ])
-
-    headers = [
-        "Ticker", "Name", "Price\n(SAR)", "Mkt Cap",
-        "1M", "3M", "6M", "1Y", "YTD",
-        "Dip from\n52W High",
-        "Div/Unit\n(SAR)", "Div\nYield",
-        "Book/NAV\n(SAR)", "P/NAV", "Disc(+)\nPrem(-)",
-    ]
-
-    print(tabulate(display_rows, headers=headers, tablefmt="rounded_outline",
-                   stralign="right", numalign="right"))
-
-    # Legend
-    print()
-    print("  P/NAV  : Price-to-Net Asset Value  (< 1.0 = trading below NAV = undervalued)")
-    print("  Disc(+): Positive = discount to NAV (undervalued), Negative = premium")
-    print("  Dip    : % below 52-week high  (0% = at all-time high, −30% = deep dip)")
+    print(tabulate(rows, headers=headers, tablefmt="rounded_outline",
+                   colalign=col_align))
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7.  CLI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SORT_ALIASES = {
+    "price": "price",
+    "mcap":  "market_cap",
+    "1m":    "ret_1m",
+    "3m":    "ret_3m",
+    "6m":    "ret_6m",
+    "1y":    "ret_1y",
+    "ytd":   "ret_ytd",
+    "yield": "div_yield",
+    "pnav":  "price_book",
+    "dip":   "dip_from_high",
+    "nav":   "nav_discount",
+}
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ksa_reits",
-        description="KSA REIT analyser — performance, dividends, valuation",
+        description="KSA REIT dynamic table builder",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Column YAML format:
+  columns:
+    - header: "My Col"
+      field: price          # direct data bag key
+      fmt: "{:.2f}"
+
+    - header: "Yield on Low"
+      expr: "annual_div / low_52w * 100 if annual_div else None"
+      fmt: pct_plain
+
+Named formatters: pct | pct_plain | sar | mcap | x | int | raw
+Sort aliases    : price mcap 1m 3m 6m 1y ytd yield pnav dip nav
+""",
     )
-    p.add_argument(
-        "-f", "--format", choices=["table", "csv", "json"], default="table",
-        help="Output format (default: table)",
-    )
-    p.add_argument(
-        "--ticker", metavar="TICKER",
-        help="Analyse a single ticker only, e.g. 4340",
-    )
-    p.add_argument(
-        "--sort", metavar="COL",
-        choices=["price", "mcap", "1y", "ytd", "yield", "pnav", "dip"],
-        default=None,
-        help="Sort by: price | mcap | 1y | ytd | yield | pnav | dip",
-    )
-    p.add_argument(
-        "--undervalued", action="store_true",
-        help="Show only REITs trading below NAV (P/NAV < 1.0)",
-    )
+    p.add_argument("-f", "--format", choices=["table", "csv", "json"],
+                   default="table")
+    p.add_argument("--columns", metavar="FILE",
+                   help="YAML file with column definitions (default: built-in)")
+    p.add_argument("--ticker", metavar="TICKER",
+                   help="Single ticker, e.g. 4340")
+    p.add_argument("--sort", metavar="ALIAS", choices=list(SORT_ALIASES),
+                   help=f"Sort ascending by: {', '.join(SORT_ALIASES)}")
+    p.add_argument("--desc", action="store_true",
+                   help="Reverse sort (descending)")
+    p.add_argument("--undervalued", action="store_true",
+                   help="Only show REITs with P/NAV < 1.0 (trading below NAV)")
+    p.add_argument("--list-fields", action="store_true",
+                   help="Fetch one ticker and list all available data bag fields")
+    p.add_argument("--write-examples", action="store_true",
+                   help="Write example YAML column files to disk and exit")
     return p
 
 
-SORT_KEY_MAP = {
-    "price": "Price (SAR)",
-    "mcap":  "Mkt Cap",
-    "1y":    "1Y %",
-    "ytd":   "YTD %",
-    "yield": "Div Yield %",
-    "pnav":  "P/NAV (x)",
-    "dip":   "Dip from High %",
-}
+def load_col_defs(path: str | None) -> list[dict]:
+    if path is None:
+        return DEFAULT_COLUMNS
+    text = Path(path).read_text()
+    data = yaml.safe_load(text)
+    return data.get("columns", data)  # support both with/without top-level key
 
 
 def main() -> None:
     args = build_parser().parse_args()
 
+    # ── write example files ──────────────────────────────────────────────────
+    if args.write_examples:
+        for fname, content in [
+            ("dividend_table.yaml",    EXAMPLE_DIVIDEND_YAML),
+            ("valuation_table.yaml",   EXAMPLE_VALUATION_YAML),
+            ("performance_table.yaml", EXAMPLE_PERFORMANCE_YAML),
+        ]:
+            Path(fname).write_text(content)
+            print(f"  wrote {fname}")
+        print("\nUsage:")
+        print("  python ksa_reits.py --columns dividend_table.yaml --sort yield")
+        print("  python ksa_reits.py --columns valuation_table.yaml --undervalued")
+        print("  python ksa_reits.py --columns performance_table.yaml --sort 1y --desc")
+        return
+
+    # ── select universe ──────────────────────────────────────────────────────
     universe = REITS
     if args.ticker:
         sym = args.ticker.upper()
         if not sym.endswith(".SR"):
             sym += ".SR"
         if sym not in REITS:
-            sys.exit(f"Unknown ticker '{sym}'. Available: {', '.join(REITS)}")
+            sys.exit(f"Unknown ticker '{sym}'")
         universe = {sym: REITS[sym]}
 
-    print(f"Fetching data for {len(universe)} KSA REITs …\n", flush=True)
+    # ── list-fields mode ─────────────────────────────────────────────────────
+    if args.list_fields:
+        sym, name = next(iter(universe.items()))
+        print(f"Fetching {sym} …\n")
+        bag = build_data_bag(sym, name)
+        print(f"{'FIELD':<35} {'VALUE'}")
+        print("─" * 70)
+        for k, v in sorted(bag.items()):
+            if k.startswith("_"):
+                continue
+            disp = str(v)
+            if len(disp) > 60:
+                disp = disp[:57] + "…"
+            print(f"  {k:<33} {disp}")
+        print(f"\n  Total fields: {sum(1 for k in bag if not k.startswith('_'))}")
+        return
 
-    rows = []
-    for symbol, name in universe.items():
-        print(f"  {symbol:<12} {name}", flush=True)
-        rows.append(fetch_reit(symbol, name))
+    # ── fetch all ────────────────────────────────────────────────────────────
+    print(f"Fetching data for {len(universe)} KSA REITs …\n", flush=True)
+    bags: list[dict] = []
+    for sym, name in universe.items():
+        print(f"  {sym:<12} {name}", flush=True)
+        bags.append(build_data_bag(sym, name))
 
     print()
 
-    # Filter
+    # ── filter ───────────────────────────────────────────────────────────────
     if args.undervalued:
-        rows = [r for r in rows if r.get("P/NAV (x)") is not None and r["P/NAV (x)"] < 1.0]
-        print(f"Showing {len(rows)} REITs trading below NAV\n")
+        bags = [b for b in bags if b.get("price_book") and b["price_book"] < 1.0]
+        print(f"→ {len(bags)} REITs trading below NAV\n")
 
-    # Sort
+    # ── sort ─────────────────────────────────────────────────────────────────
     if args.sort:
-        key = SORT_KEY_MAP[args.sort]
-        rows.sort(key=lambda r: (r.get(key) is None, r.get(key) or 0))
+        key = SORT_ALIASES[args.sort]
+        bags.sort(key=lambda b: (b.get(key) is None, b.get(key) or 0),
+                  reverse=args.desc)
 
-    print_table(rows, args.format)
+    # ── column definitions ───────────────────────────────────────────────────
+    col_defs = load_col_defs(args.columns)
+
+    # ── render ───────────────────────────────────────────────────────────────
+    render_table(bags, col_defs, args.format)
+
+    if args.format == "table":
+        print()
+        print("  Named formatters : pct | pct_plain | sar | mcap | x | int | raw")
+        print("  field            : direct data bag key  (--list-fields to see all)")
+        print("  expr             : any Python expression with bag variables in scope")
+        print()
+        print("  python ksa_reits.py --write-examples   # generate sample YAML files")
+        print("  python ksa_reits.py --list-fields       # see all available fields")
 
 
 if __name__ == "__main__":
