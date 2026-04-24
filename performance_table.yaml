@@ -1,0 +1,45 @@
+# performance_table.yaml — returns across timeframes
+# Run: python ksa_reits.py --columns performance_table.yaml --sort 1y
+columns:
+  - header: "Ticker"
+    field: ticker
+    align: left
+
+  - header: "Name"
+    field: name
+    align: left
+    width: 22
+
+  - header: "Price"
+    field: price
+    fmt: "{:.2f}"
+
+  - header: "YTD"
+    field: ret_ytd
+    fmt: pct
+
+  - header: "1M"
+    field: ret_1m
+    fmt: pct
+
+  - header: "3M"
+    field: ret_3m
+    fmt: pct
+
+  - header: "6M"
+    field: ret_6m
+    fmt: pct
+
+  - header: "1Y"
+    field: ret_1y
+    fmt: pct
+
+  - header: "Momentum
+(1M-3M avg)"
+    expr: "(ret_1m + ret_3m) / 2 if (ret_1m is not None and ret_3m is not None) else None"
+    fmt: pct
+
+  - header: "Volatility
+Proxy"
+    expr: "abs(day_high - day_low) / price * 100 if price else None"
+    fmt: "{:.2f}%"

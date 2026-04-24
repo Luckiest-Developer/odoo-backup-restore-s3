@@ -1,0 +1,37 @@
+# dividend_table.yaml — yield-focused columns
+# Run: python ksa_reits.py --columns dividend_table.yaml --sort yield
+columns:
+  - header: "Ticker"
+    field: ticker
+    align: left
+
+  - header: "Name"
+    field: name
+    align: left
+    width: 22
+
+  - header: "Price"
+    field: price
+    fmt: "{:.2f}"
+
+  - header: "Div/Unit"
+    field: annual_div
+    fmt: "{:.3f}"
+
+  - header: "Yield %"
+    field: div_yield
+    fmt: pct_plain
+
+  - header: "Yield on
+52W Low"
+    expr: "annual_div / low_52w * 100 if (annual_div and low_52w) else None"
+    fmt: pct_plain
+
+  - header: "Payout
+Cover (x)"
+    expr: "trailingPE / (price / annual_div) if (trailingPE and annual_div and price) else None"
+    fmt: "{:.2f}x"
+
+  - header: "Mkt Cap"
+    field: market_cap
+    fmt: mcap

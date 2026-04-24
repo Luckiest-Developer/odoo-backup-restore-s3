@@ -1,0 +1,47 @@
+# valuation_table.yaml — NAV / undervalue focus
+# Run: python ksa_reits.py --columns valuation_table.yaml --sort pnav
+columns:
+  - header: "Ticker"
+    field: ticker
+    align: left
+
+  - header: "Name"
+    field: name
+    align: left
+    width: 22
+
+  - header: "Price
+(SAR)"
+    field: price
+    fmt: "{:.2f}"
+
+  - header: "Book/NAV
+(SAR)"
+    field: book_value
+    fmt: "{:.2f}"
+
+  - header: "P/NAV"
+    field: price_book
+    fmt: x
+
+  - header: "Discount
+to NAV %"
+    field: nav_discount
+    fmt: "{:+.1f}%"
+
+  - header: "Upside to
+NAV (SAR)"
+    expr: "book_value - price if (book_value and price) else None"
+    fmt: "{:+.2f}"
+
+  - header: "52W High"
+    field: high_52w
+    fmt: "{:.2f}"
+
+  - header: "Dip %"
+    field: dip_from_high
+    fmt: pct
+
+  - header: "1Y Perf"
+    field: ret_1y
+    fmt: pct
