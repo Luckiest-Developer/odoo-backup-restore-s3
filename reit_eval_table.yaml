@@ -1,0 +1,89 @@
+# reit_eval_table.yaml
+# Comprehensive REIT evaluation — valuation, income, performance, risk
+# Run: python ksa_reits.py --columns reit_eval_table.yaml --sort pnav
+
+columns:
+
+  # ── Identity ───────────────────────────────────────────────────────────────
+  - header: "Ticker"
+    field: ticker
+    align: left
+
+  - header: "Name"
+    field: name
+    align: left
+    width: 22
+
+  # ── Price & Size ───────────────────────────────────────────────────────────
+  - header: "Price\n(SAR)"
+    field: price
+    fmt: "{:.2f}"
+
+  - header: "Mkt Cap"
+    field: market_cap
+    fmt: mcap
+
+  # ── NAV Valuation ──────────────────────────────────────────────────────────
+  - header: "NAV/Unit\n(SAR)"
+    field: book_value
+    fmt: "{:.2f}"
+
+  - header: "P/NAV"
+    field: price_book
+    fmt: "{:.3f}x"
+
+  - header: "Disc(+)\nPrem(-)"
+    field: nav_discount
+    fmt: "{:+.1f}%"
+
+  - header: "Upside\nto NAV"
+    expr: "book_value - price if (book_value and price) else None"
+    fmt: "{:+.2f}"
+
+  # ── Income ─────────────────────────────────────────────────────────────────
+  - header: "Div/Unit\n(SAR)"
+    field: annual_div
+    fmt: "{:.3f}"
+
+  - header: "Div\nYield"
+    field: div_yield
+    fmt: "{:.2f}%"
+
+  - header: "Yield on\nNAV"
+    expr: "annual_div / book_value * 100 if (annual_div and book_value) else None"
+    fmt: "{:.2f}%"
+
+  # ── Total Return (price appreciation + dividend income) ────────────────────
+  - header: "Total\nReturn 1Y"
+    expr: "ret_1y + div_yield if (ret_1y is not None and div_yield is not None) else None"
+    fmt: "{:+.2f}%"
+
+  # ── Price Performance ──────────────────────────────────────────────────────
+  - header: "1Y Price\nReturn"
+    field: ret_1y
+    fmt: pct
+
+  - header: "YTD"
+    field: ret_ytd
+    fmt: pct
+
+  - header: "3M"
+    field: ret_3m
+    fmt: pct
+
+  # ── Risk & Range ───────────────────────────────────────────────────────────
+  - header: "Dip from\n52W High"
+    field: dip_from_high
+    fmt: "{:+.1f}%"
+
+  - header: "52W\nLow"
+    field: low_52w
+    fmt: "{:.2f}"
+
+  - header: "52W\nHigh"
+    field: high_52w
+    fmt: "{:.2f}"
+
+  - header: "Where in\n52W Range"
+    expr: "range_position"
+    fmt: "{:.0f}%"
